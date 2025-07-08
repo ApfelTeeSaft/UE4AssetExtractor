@@ -11,6 +11,24 @@
 
 #include "SDK.hpp"
 
+enum class MessageType : int
+{
+    Progress = 1,
+    ObjectData = 2,
+    Status = 3,
+    Error = 4,
+    Complete = 5
+};
+
+#pragma pack(push, 1)
+struct MessageHeader
+{
+    MessageType Type;
+    int DataLength;
+    long long Timestamp;
+};
+#pragma pack(pop)
+
 struct CompleteObjectData {
     std::string Name;
     std::string FullName;
@@ -63,6 +81,33 @@ struct CompleteObjectData {
     } AnimInfo;
 };
 
+class SharedMemoryCommunicator {
+private:
+    HANDLE m_hMemoryMap;
+    HANDLE m_hDataAvailableEvent;
+    HANDLE m_hDataReadEvent;
+    void* m_pMappedView;
+    std::string m_MemoryName;
+    std::string m_DataEventName;
+    std::string m_ReadEventName;
+
+    // Simple atomic flag instead of mutex to avoid game crashes
+    volatile LONG m_WriteBusy;
+    static const size_t BUFFER_SIZE = 64 * 1024; // 64KB
+
+public:
+    SharedMemoryCommunicator();
+    ~SharedMemoryCommunicator();
+
+    bool Initialize(const std::string& baseName);
+    void Cleanup();
+    bool SendMessage(MessageType type, const std::string& data);
+    bool SendProgress(int percentage, const std::string& message, uint32_t processed = 0, uint32_t total = 0);
+    bool SendStatus(const std::string& status);
+    bool SendError(const std::string& error);
+    bool SendComplete();
+};
+
 class UE4Extractor {
 private:
     std::atomic<bool> m_bIsRunning{ false };
@@ -71,8 +116,7 @@ private:
     std::atomic<uint32_t> m_ProcessedObjects{ 0 };
     std::atomic<uint32_t> m_TotalObjects{ 0 };
 
-    HANDLE m_hPipe;
-    std::string m_PipeName;
+    std::unique_ptr<SharedMemoryCommunicator> m_pCommunicator;
     std::string m_OutputDirectory;
 
     HANDLE m_hExtractionThread;
@@ -111,7 +155,7 @@ private:
     bool IsValidMemoryAddress(uintptr_t Address);
     std::string SafeGetString(const char* str);
 
-    bool InitializePipe();
+    bool InitializeCommunication(const std::string& baseName);
     void SendProgress(int percentage, const std::string& message, uint32_t processed = 0, uint32_t total = 0);
     void SendObjectData(const CompleteObjectData& objectData);
     void ProcessCommands();
@@ -134,7 +178,7 @@ public:
     UE4Extractor();
     ~UE4Extractor();
 
-    bool Initialize(const std::string& pipeName, const std::string& outputDir = "");
+    bool Initialize(const std::string& baseName, const std::string& outputDir = "");
     void StartExtraction();
     void StopExtraction();
     bool IsRunning() const { return m_bIsRunning.load(); }
@@ -148,7 +192,7 @@ extern UE4Extractor* g_pExtractor;
 extern "C" {
     __declspec(dllexport) UE4Extractor* CreateExtractor();
     __declspec(dllexport) void DestroyExtractor(UE4Extractor* extractor);
-    __declspec(dllexport) bool InitializeExtractor(UE4Extractor* extractor, const char* pipeName, const char* outputDir);
+    __declspec(dllexport) bool InitializeExtractor(UE4Extractor* extractor, const char* baseName, const char* outputDir);
     __declspec(dllexport) void StartExtraction(UE4Extractor* extractor);
     __declspec(dllexport) void StopExtraction(UE4Extractor* extractor);
     __declspec(dllexport) bool IsExtractionRunning(UE4Extractor* extractor);

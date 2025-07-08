@@ -30,16 +30,29 @@ namespace UE4ExtractorGUI
                             builder.SetMinimumLevel(LogLevel.Debug);
                         });
 
-                        services.AddSingleton<IDLLInjector, DLLInjector>();
+                        // Register the shared memory injector with logger factory
+                        services.AddSingleton<ISharedMemoryInjector>(provider =>
+                        {
+                            var logger = provider.GetRequiredService<ILogger<SharedMemoryInjector>>();
+                            var loggerFactory = provider.GetRequiredService<ILoggerFactory>();
+                            return new SharedMemoryInjector(logger, loggerFactory);
+                        });
+
+                        // Also register as IDLLInjector for compatibility
+                        services.AddSingleton<IDLLInjector>(provider =>
+                            provider.GetRequiredService<ISharedMemoryInjector>());
+
+                        // Register the shared memory client logger
+                        services.AddSingleton<ILogger<SharedMemoryClient>>(provider =>
+                            provider.GetRequiredService<ILoggerFactory>().CreateLogger<SharedMemoryClient>());
 
                         services.AddTransient<MainViewModel>();
-
                         services.AddTransient<MainWindow>();
                     })
                     .Build();
 
                 var logger = _host.Services.GetRequiredService<ILogger<App>>();
-                logger.LogInformation("Application starting up...");
+                logger.LogInformation("Application starting up with shared memory communication...");
 
                 var mainWindow = _host.Services.GetRequiredService<MainWindow>();
                 MainWindow = mainWindow;

@@ -11,7 +11,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     case DLL_PROCESS_ATTACH:
     {
         DebugLog("=== DLL_PROCESS_ATTACH START ===");
-        DebugLog("Process ID: " + std::to_string(GetCurrentProcessId()));
+
+        DWORD processId = GetCurrentProcessId();
+        DebugLog("Process ID: " + std::to_string(processId));
 
         DisableThreadLibraryCalls(hModule);
 
@@ -19,11 +21,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             DebugLog("Creating UE4Extractor instance...");
             g_pExtractor = new UE4Extractor();
 
-            std::string pipeName = "UE4Extractor_" + std::to_string(GetCurrentProcessId());
-            DebugLog("Pipe name: " + pipeName);
+            // Use process ID as the base name for shared memory objects
+            std::string baseName = std::to_string(processId);
+            DebugLog("Base name for shared memory: " + baseName);
 
-            DebugLog("Calling Initialize...");
-            if (!g_pExtractor->Initialize(pipeName)) {
+            DebugLog("Calling Initialize with shared memory...");
+            if (!g_pExtractor->Initialize(baseName)) {
                 DebugLog("ERROR: Initialize() returned false");
                 delete g_pExtractor;
                 g_pExtractor = nullptr;

@@ -4,10 +4,8 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
-using System.IO.Pipes;
 using System.Linq;
 using System.Runtime.CompilerServices;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Input;
@@ -19,9 +17,9 @@ namespace UE4ExtractorGUI.ViewModels
     public class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         private readonly ILogger<MainViewModel> _logger;
-        private readonly IDLLInjector _dllInjector;
+        private readonly ISharedMemoryInjector _injector;
 
-        private NamedPipeClientStream? _pipeClient;
+        private SharedMemoryClient? _sharedMemoryClient;
         private CancellationTokenSource? _cancellationTokenSource;
         private Timer? _processRefreshTimer;
 
@@ -42,10 +40,10 @@ namespace UE4ExtractorGUI.ViewModels
         public ICommand BrowseOutputDirectoryCommand { get; }
         public ICommand ClearLogCommand { get; }
 
-        public MainViewModel(ILogger<MainViewModel> logger, IDLLInjector dllInjector)
+        public MainViewModel(ILogger<MainViewModel> logger, ISharedMemoryInjector injector)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-            _dllInjector = dllInjector ?? throw new ArgumentNullException(nameof(dllInjector));
+            _injector = injector ?? throw new ArgumentNullException(nameof(injector));
 
             StartExtractionCommand = new RelayCommand(async () => await StartExtractionAsync(), () => CanStartExtraction());
             StopExtractionCommand = new RelayCommand(StopExtraction, () => _isExtracting);
@@ -176,17 +174,6 @@ namespace UE4ExtractorGUI.ViewModels
                 LogMessage($"x86 DLL Architecture: {x86DllArch}");
             }
 
-            var debugPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "UE4ExtractorDLL", "Debug", "UE4ExtractorDLL.dll");
-            debugPath = Path.GetFullPath(debugPath);
-            LogMessage($"Debug Build Path: {debugPath}");
-            LogMessage($"Debug Build Exists: {File.Exists(debugPath)}");
-
-            if (File.Exists(debugPath))
-            {
-                var debugArch = GetDllArchitecture(debugPath);
-                LogMessage($"Debug Build Architecture: {debugArch}");
-            }
-
             LogMessage("=== END VERIFICATION ===");
         }
 
@@ -198,14 +185,14 @@ namespace UE4ExtractorGUI.ViewModels
                 var buffer = new byte[4096];
                 fs.Read(buffer, 0, buffer.Length);
 
-                if (buffer[0] != 0x4D || buffer[1] != 0x5A) // "MZ"
+                if (buffer[0] != 0x4D || buffer[1] != 0x5A)
                     return "Not a PE file";
 
                 int peOffset = BitConverter.ToInt32(buffer, 0x3C);
                 if (peOffset >= buffer.Length - 4)
                     return "Invalid PE header";
 
-                if (buffer[peOffset] != 0x50 || buffer[peOffset + 1] != 0x45) // "PE"
+                if (buffer[peOffset] != 0x50 || buffer[peOffset + 1] != 0x45)
                     return "Invalid PE signature";
 
                 int machineType = BitConverter.ToUInt16(buffer, peOffset + 4);
@@ -230,13 +217,13 @@ namespace UE4ExtractorGUI.ViewModels
         {
             var antiCheatNames = new[]
             {
-                "BEService", "BattlEye", "BEDaisy",  // BattlEye
-                "EasyAntiCheat", "EACService",       // Easy Anti-Cheat  
-                "vgc", "vgtray",                     // Valorant/Riot Vanguard
-                "FACEITService",                     // FACEIT
-                "ESEA",                              // ESEA
-                "VAC", "Steam",                      // VAC (Steam)
-                "PnkBstrA", "PnkBstrB"              // PunkBuster
+                "BEService", "BattlEye", "BEDaisy",
+                "EasyAntiCheat", "EACService",
+                "vgc", "vgtray",
+                "FACEITService",
+                "ESEA",
+                "VAC", "Steam",
+                "PnkBstrA", "PnkBstrB"
             };
 
             var detectedProcesses = new List<string>();
@@ -295,7 +282,7 @@ namespace UE4ExtractorGUI.ViewModels
         {
             try
             {
-                LogMessage("UE4.12 Asset Extractor initialized successfully.");
+                LogMessage("UE4.12 Asset Extractor with Shared Memory Communication initialized successfully.");
                 LogDiagnosticInfo();
 
                 OutputDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "UE4_Extracted_Assets");
@@ -329,8 +316,7 @@ namespace UE4ExtractorGUI.ViewModels
 
                 LogMessage($"Starting extraction for process: {_selectedProcess!.ProcessName} (PID: {_selectedProcess.ProcessId})");
 
-
-                StatusMessage = "Injecting DLL...";
+                StatusMessage = "Injecting DLL and setting up shared memory...";
 
                 var dllPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "UE4ExtractorDLL.dll");
 
@@ -342,29 +328,55 @@ namespace UE4ExtractorGUI.ViewModels
                 await ValidateDllFile(dllPath);
 
                 LogMessage($"Using DLL: {dllPath}");
-                LogMessage("Attempting DLL injection...");
+                LogMessage("Attempting DLL injection with shared memory setup...");
 
-                var injectionSuccess = await _dllInjector.InjectDLLAsync(_selectedProcess.ProcessId, dllPath);
+                // Inject DLL and create shared memory client
+                _sharedMemoryClient = await _injector.InjectAndCreateClientAsync(_selectedProcess.ProcessId, dllPath);
 
-                if (!injectionSuccess)
+                LogMessage("DLL injection successful, connecting to shared memory...");
+                StatusMessage = "Connecting to shared memory...";
+
+                // Connect to shared memory
+                bool connected = await _sharedMemoryClient.ConnectAsync(30000); // 30 second timeout
+
+                if (!connected)
                 {
-                    throw new Exception("Failed to inject DLL into target process");
+                    throw new TimeoutException("Failed to connect to shared memory within 30 seconds");
                 }
 
-                LogMessage("DLL injection successful");
-                StatusMessage = "Waiting for DLL initialization...";
+                LogMessage("Successfully connected to shared memory");
+                StatusMessage = "Setting up event handlers...";
 
-                LogMessage("Waiting 5 seconds for DLL to initialize...");
-                await Task.Delay(5000);
+                // Set up event handlers
+                _sharedMemoryClient.ProgressReceived += OnProgressReceived;
+                _sharedMemoryClient.StatusReceived += OnStatusReceived;
+                _sharedMemoryClient.ErrorReceived += OnErrorReceived;
+                _sharedMemoryClient.ExtractionComplete += OnExtractionComplete;
 
-                StatusMessage = "Connecting to extraction service...";
+                LogMessage("Event handlers configured, starting monitoring...");
 
-                await ConnectToPipeAsync($"UE4Extractor_{_selectedProcess.ProcessId}");
+                // Start monitoring in background
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _sharedMemoryClient.StartMonitoringAsync(_cancellationTokenSource.Token);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!_cancellationTokenSource.Token.IsCancellationRequested)
+                        {
+                            await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
+                            {
+                                LogMessage($"Error in shared memory monitoring: {ex.Message}");
+                                StatusMessage = "Communication error occurred";
+                                IsExtracting = false;
+                            });
+                        }
+                    }
+                }, _cancellationTokenSource.Token);
 
-
-                _ = Task.Run(() => MonitorExtractionProgressAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
-
-                LogMessage("Extraction started successfully");
+                LogMessage("Extraction started successfully with shared memory communication");
                 StatusMessage = "Extracting assets...";
             }
             catch (TimeoutException ex)
@@ -402,7 +414,10 @@ namespace UE4ExtractorGUI.ViewModels
             try
             {
                 _cancellationTokenSource?.Cancel();
-                _pipeClient?.Close();
+
+                // Dispose of shared memory client
+                _sharedMemoryClient?.Dispose();
+                _sharedMemoryClient = null;
 
                 IsExtracting = false;
                 StatusMessage = "Extraction stopped";
@@ -431,7 +446,7 @@ namespace UE4ExtractorGUI.ViewModels
                     var buffer = new byte[2];
                     fs.Read(buffer, 0, 2);
 
-                    if (buffer[0] != 0x4D || buffer[1] != 0x5A) // "MZ" header
+                    if (buffer[0] != 0x4D || buffer[1] != 0x5A)
                     {
                         throw new InvalidDataException("DLL file is not a valid PE executable");
                     }
@@ -445,12 +460,87 @@ namespace UE4ExtractorGUI.ViewModels
             });
         }
 
+        // Shared Memory Event Handlers
+        private void OnProgressReceived(ProgressData progressData)
+        {
+            try
+            {
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    ProgressPercentage = progressData.Percentage;
+                    StatusMessage = progressData.Message;
+
+                    var logMessage = $"Progress: {progressData.Percentage}% - {progressData.Message}";
+                    if (progressData.TotalObjects > 0)
+                    {
+                        logMessage += $" ({progressData.ProcessedObjects}/{progressData.TotalObjects})";
+                    }
+
+                    LogMessage(logMessage);
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing progress update");
+            }
+        }
+
+        private void OnStatusReceived(string status)
+        {
+            try
+            {
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    StatusMessage = status;
+                    LogMessage($"Status: {status}");
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing status update");
+            }
+        }
+
+        private void OnErrorReceived(string error)
+        {
+            try
+            {
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    StatusMessage = "Error occurred";
+                    LogMessage($"❌ Error: {error}");
+                    IsExtracting = false;
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing error message");
+            }
+        }
+
+        private void OnExtractionComplete()
+        {
+            try
+            {
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    IsExtracting = false;
+                    StatusMessage = "Extraction completed successfully";
+                    ProgressPercentage = 100;
+                    LogMessage("🎉 Extraction completed successfully!");
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing extraction completion");
+            }
+        }
+
         private void RefreshProcesses()
         {
             try
             {
                 var processes = new List<ProcessInfo>();
-
                 var allProcesses = Process.GetProcesses();
 
                 foreach (var process in allProcesses)
@@ -468,7 +558,6 @@ namespace UE4ExtractorGUI.ViewModels
                             processName.Contains("fortnite") ||
                             processName.Contains("rocket") ||
                             processName.Contains("ark"))
-                            // TODO:: make universal by scanning memory?
                         {
                             var processInfo = new ProcessInfo
                             {
@@ -568,179 +657,6 @@ namespace UE4ExtractorGUI.ViewModels
             LogMessage("Log cleared");
         }
 
-        private async Task ConnectToPipeAsync(string pipeName)
-        {
-            LogMessage($"Attempting to connect to pipe: {pipeName}");
-            LogMessage("Waiting for DLL to initialize and create pipe...");
-
-            await Task.Delay(3000);
-
-            int maxAttempts = 8;
-            int attemptTimeout = 10000;
-
-            for (int attempt = 1; attempt <= maxAttempts; attempt++)
-            {
-                try
-                {
-                    LogMessage($"Connection attempt {attempt}/{maxAttempts}...");
-
-                    _pipeClient?.Dispose();
-                    _pipeClient = new NamedPipeClientStream(".", pipeName, PipeDirection.In);
-
-                    await _pipeClient.ConnectAsync(attemptTimeout);
-
-                    LogMessage($"Successfully connected to pipe: {pipeName}");
-                    LogMessage("Testing pipe connection...");
-
-                    await Task.Delay(2000);
-
-                    LogMessage("Pipe connection established, waiting for messages...");
-                    return;
-                }
-                catch (TimeoutException)
-                {
-                    if (attempt < maxAttempts)
-                    {
-                        LogMessage($"Attempt {attempt} timed out after {attemptTimeout}ms, retrying in 2 seconds...");
-                        await Task.Delay(2000);
-                    }
-                    else
-                    {
-                        throw new TimeoutException($"Failed to connect to pipe after {maxAttempts} attempts ({maxAttempts * attemptTimeout / 1000} seconds total).");
-                    }
-                }
-                catch (IOException ex) when (ex.Message.Contains("pipe has been ended"))
-                {
-                    LogMessage($"Pipe ended during connection attempt {attempt}: {ex.Message}");
-                    if (attempt < maxAttempts)
-                    {
-                        await Task.Delay(2000);
-                    }
-                    else
-                    {
-                        throw new InvalidOperationException($"Pipe keeps ending during connection: {ex.Message}", ex);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    LogMessage($"Connection attempt {attempt} failed: {ex.Message}");
-                    if (attempt < maxAttempts)
-                    {
-                        await Task.Delay(2000);
-                    }
-                    else
-                    {
-                        throw new InvalidOperationException($"Failed to connect after {maxAttempts} attempts: {ex.Message}", ex);
-                    }
-                }
-            }
-        }
-
-        private async Task MonitorExtractionProgressAsync(CancellationToken cancellationToken)
-        {
-            try
-            {
-                if (_pipeClient == null) return;
-
-                LogMessage("Starting to monitor extraction progress...");
-
-                using var reader = new StreamReader(_pipeClient, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 1024, leaveOpen: false);
-                var startTime = DateTime.UtcNow;
-
-                while (!cancellationToken.IsCancellationRequested && _pipeClient.IsConnected)
-                {
-                    try
-                    {
-                        var line = await reader.ReadLineAsync();
-                        if (line == null)
-                        {
-                            LogMessage("Pipe stream ended (received null) - extraction may be complete");
-                            break;
-                        }
-
-                        if (!string.IsNullOrWhiteSpace(line))
-                        {
-                            ProcessPipeMessage(line.Trim(), startTime);
-                        }
-                    }
-                    catch (IOException ex) when (ex.Message.Contains("pipe has been ended") || ex.Message.Contains("pipe is broken"))
-                    {
-                        LogMessage($"Pipe ended normally: {ex.Message}");
-                        break;
-                    }
-                    catch (ObjectDisposedException)
-                    {
-                        LogMessage("Pipe was disposed - extraction stopped");
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        LogMessage($"Error reading from pipe: {ex.Message}");
-                        break;
-                    }
-                }
-
-                LogMessage("Extraction monitoring ended");
-            }
-            catch (Exception ex)
-            {
-                if (!cancellationToken.IsCancellationRequested)
-                {
-                    await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
-                    {
-                        LogMessage($"Error monitoring extraction: {ex.Message}");
-                        IsExtracting = false;
-                    });
-                }
-            }
-        }
-
-        private void ProcessPipeMessage(string message, DateTime startTime)
-        {
-            try
-            {
-                LogMessage($"Raw pipe message: '{message}'");
-
-                var parts = message.Split('|');
-                if (parts.Length >= 2)
-                {
-                    if (int.TryParse(parts[0], out int percentage))
-                    {
-                        var statusMessage = parts[1];
-                        var elapsed = DateTime.UtcNow - startTime;
-
-                        System.Windows.Application.Current.Dispatcher.Invoke(() =>
-                        {
-                            ProgressPercentage = percentage;
-                            StatusMessage = statusMessage;
-
-                            LogMessage($"Progress: {percentage}% - {statusMessage}");
-
-                            if (percentage >= 100)
-                            {
-                                IsExtracting = false;
-                                StatusMessage = "Extraction completed successfully";
-                                LogMessage("Extraction completed successfully!");
-                            }
-                        });
-                    }
-                    else
-                    {
-                        LogMessage($"Could not parse percentage from: '{parts[0]}'");
-                    }
-                }
-                else
-                {
-                    LogMessage($"Message format unexpected: '{message}' (parts: {parts.Length})");
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to process pipe message: {Message}", message);
-                LogMessage($"Error processing message '{message}': {ex.Message}");
-            }
-        }
-
         private void RefreshProcessesTimer(object? state)
         {
             if (!_disposed && !_isExtracting)
@@ -793,7 +709,7 @@ namespace UE4ExtractorGUI.ViewModels
             _disposed = true;
             _processRefreshTimer?.Dispose();
             _cancellationTokenSource?.Dispose();
-            _pipeClient?.Dispose();
+            _sharedMemoryClient?.Dispose();
         }
     }
 

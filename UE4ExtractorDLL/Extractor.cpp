@@ -6,33 +6,262 @@
 #include <algorithm>
 #include <psapi.h>
 #include <dbghelp.h>
+#include <shlobj.h>
 #include "framework.h"
 
 #include "SDK.hpp"
 
 UE4Extractor* g_pExtractor = nullptr;
 
+// SharedMemoryCommunicator Implementation
+SharedMemoryCommunicator::SharedMemoryCommunicator()
+    : m_hMemoryMap(NULL)
+    , m_hDataAvailableEvent(NULL)
+    , m_hDataReadEvent(NULL)
+    , m_pMappedView(nullptr)
+    , m_WriteBusy(0)
+{
+}
+
+SharedMemoryCommunicator::~SharedMemoryCommunicator() {
+    Cleanup();
+}
+
+bool SharedMemoryCommunicator::Initialize(const std::string& baseName) {
+    try {
+        DebugLog("=== SharedMemoryCommunicator::Initialize START ===");
+        DebugLog("Base name: " + baseName);
+
+        m_MemoryName = "UE4Extractor_Memory_" + baseName;
+        m_DataEventName = "UE4Extractor_DataAvailable_" + baseName;
+        m_ReadEventName = "UE4Extractor_DataRead_" + baseName;
+
+        DebugLog("Memory name: " + m_MemoryName);
+        DebugLog("Data event name: " + m_DataEventName);
+        DebugLog("Read event name: " + m_ReadEventName);
+
+        // Create memory-mapped file
+        m_hMemoryMap = CreateFileMappingA(
+            INVALID_HANDLE_VALUE,
+            NULL,
+            PAGE_READWRITE,
+            0,
+            BUFFER_SIZE,
+            m_MemoryName.c_str()
+        );
+
+        if (m_hMemoryMap == NULL) {
+            DWORD error = GetLastError();
+            DebugLog("ERROR: CreateFileMapping failed with error: " + std::to_string(error));
+            return false;
+        }
+
+        DebugLog("Memory-mapped file created successfully");
+
+        // Map view of file
+        m_pMappedView = MapViewOfFile(
+            m_hMemoryMap,
+            FILE_MAP_ALL_ACCESS,
+            0,
+            0,
+            BUFFER_SIZE
+        );
+
+        if (m_pMappedView == nullptr) {
+            DWORD error = GetLastError();
+            DebugLog("ERROR: MapViewOfFile failed with error: " + std::to_string(error));
+            return false;
+        }
+
+        DebugLog("Memory view mapped successfully");
+
+        // Initialize the memory with zeros
+        ZeroMemory(m_pMappedView, BUFFER_SIZE);
+
+        // Create events
+        m_hDataAvailableEvent = CreateEventA(
+            NULL,
+            FALSE, // Auto-reset
+            FALSE, // Initially not signaled
+            m_DataEventName.c_str()
+        );
+
+        if (m_hDataAvailableEvent == NULL) {
+            DWORD error = GetLastError();
+            DebugLog("ERROR: CreateEvent (DataAvailable) failed with error: " + std::to_string(error));
+            return false;
+        }
+
+        m_hDataReadEvent = CreateEventA(
+            NULL,
+            FALSE, // Auto-reset
+            FALSE, // Initially not signaled
+            m_ReadEventName.c_str()
+        );
+
+        if (m_hDataReadEvent == NULL) {
+            DWORD error = GetLastError();
+            DebugLog("ERROR: CreateEvent (DataRead) failed with error: " + std::to_string(error));
+            return false;
+        }
+
+        DebugLog("Events created successfully");
+        DebugLog("=== SharedMemoryCommunicator::Initialize SUCCESS ===");
+        return true;
+    }
+    catch (const std::exception& e) {
+        DebugLog("EXCEPTION in Initialize: " + std::string(e.what()));
+        return false;
+    }
+    catch (...) {
+        DebugLog("UNKNOWN EXCEPTION in Initialize");
+        return false;
+    }
+}
+
+void SharedMemoryCommunicator::Cleanup() {
+    if (m_pMappedView) {
+        UnmapViewOfFile(m_pMappedView);
+        m_pMappedView = nullptr;
+    }
+
+    if (m_hMemoryMap) {
+        CloseHandle(m_hMemoryMap);
+        m_hMemoryMap = NULL;
+    }
+
+    if (m_hDataAvailableEvent) {
+        CloseHandle(m_hDataAvailableEvent);
+        m_hDataAvailableEvent = NULL;
+    }
+
+    if (m_hDataReadEvent) {
+        CloseHandle(m_hDataReadEvent);
+        m_hDataReadEvent = NULL;
+    }
+}
+
+bool SharedMemoryCommunicator::SendMessage(MessageType type, const std::string& data) {
+    // Simple atomic busy flag - if another thread is writing, skip this message
+    if (InterlockedCompareExchange(&m_WriteBusy, 1, 0) != 0) {
+        DebugLog("WARNING: Skipping message - another thread is writing");
+        return false;
+    }
+
+    try {
+        if (!m_pMappedView || !m_hDataAvailableEvent || !m_hDataReadEvent) {
+            DebugLog("ERROR: SendMessage called but not initialized");
+            InterlockedExchange(&m_WriteBusy, 0);
+            return false;
+        }
+
+        // Create message header
+        MessageHeader header;
+        header.Type = type;
+        header.DataLength = static_cast<int>(data.length());
+        header.Timestamp = GetTickCount64();
+
+        size_t totalSize = sizeof(MessageHeader) + data.length();
+        if (totalSize > BUFFER_SIZE) {
+            DebugLog("ERROR: Message too large: " + std::to_string(totalSize) + " bytes");
+            InterlockedExchange(&m_WriteBusy, 0);
+            return false;
+        }
+
+        // Copy header to shared memory
+        memcpy(m_pMappedView, &header, sizeof(MessageHeader));
+
+        // Copy data to shared memory
+        if (data.length() > 0) {
+            memcpy(static_cast<char*>(m_pMappedView) + sizeof(MessageHeader), data.c_str(), data.length());
+        }
+
+        // Signal that data is available
+        if (!SetEvent(m_hDataAvailableEvent)) {
+            DWORD error = GetLastError();
+            DebugLog("ERROR: SetEvent failed with error: " + std::to_string(error));
+            InterlockedExchange(&m_WriteBusy, 0);
+            return false;
+        }
+
+        // Wait for the client to read the data (with timeout)
+        DWORD result = WaitForSingleObject(m_hDataReadEvent, 5000); // 5 second timeout
+        if (result != WAIT_OBJECT_0) {
+            if (result == WAIT_TIMEOUT) {
+                DebugLog("WARNING: Timeout waiting for data to be read");
+            }
+            else {
+                DebugLog("ERROR: WaitForSingleObject failed: " + std::to_string(result));
+            }
+            // Continue anyway, don't fail the send operation
+        }
+
+        InterlockedExchange(&m_WriteBusy, 0);
+        return true;
+    }
+    catch (const std::exception& e) {
+        DebugLog("EXCEPTION in SendMessage: " + std::string(e.what()));
+        InterlockedExchange(&m_WriteBusy, 0);
+        return false;
+    }
+    catch (...) {
+        DebugLog("UNKNOWN EXCEPTION in SendMessage");
+        InterlockedExchange(&m_WriteBusy, 0);
+        return false;
+    }
+}
+
+bool SharedMemoryCommunicator::SendProgress(int percentage, const std::string& message, uint32_t processed, uint32_t total) {
+    std::ostringstream oss;
+    oss << percentage << "|" << message;
+    if (total > 0) {
+        oss << "|" << processed << "|" << total;
+    }
+
+    DebugLog("Sending progress: " + oss.str());
+    return SendMessage(MessageType::Progress, oss.str());
+}
+
+bool SharedMemoryCommunicator::SendStatus(const std::string& status) {
+    DebugLog("Sending status: " + status);
+    return SendMessage(MessageType::Status, status);
+}
+
+bool SharedMemoryCommunicator::SendError(const std::string& error) {
+    DebugLog("Sending error: " + error);
+    return SendMessage(MessageType::Error, error);
+}
+
+bool SharedMemoryCommunicator::SendComplete() {
+    DebugLog("Sending completion signal");
+    return SendMessage(MessageType::Complete, "Extraction completed");
+}
+
+std::string GetDesktopPath() {
+    char path[MAX_PATH];
+    if (SHGetFolderPathA(NULL, CSIDL_DESKTOP, NULL, 0, path) == S_OK) {
+        return std::string(path);
+    }
+    return "";
+}
+
 UE4Extractor::UE4Extractor()
-    : m_hPipe(INVALID_HANDLE_VALUE)
-    , m_hExtractionThread(NULL)
+    : m_hExtractionThread(NULL)
     , m_hCommunicationThread(NULL)
     , m_dwMainThreadId(GetCurrentThreadId())
 {
-    m_OutputDirectory = "\\UE4_Extracted_Assets";
+    std::string desktopPath = GetDesktopPath();
+
+    m_OutputDirectory = desktopPath + "\\UE4_Extracted_Assets";
+    m_pCommunicator = std::make_unique<SharedMemoryCommunicator>();
 }
 
 UE4Extractor::~UE4Extractor() {
     StopExtraction();
     CleanupSDK();
-
-    if (m_hPipe != INVALID_HANDLE_VALUE) {
-        CloseHandle(m_hPipe);
-    }
 }
 
-bool UE4Extractor::Initialize(const std::string& pipeName, const std::string& outputDir) {
-    m_PipeName = pipeName;
-
+bool UE4Extractor::Initialize(const std::string& baseName, const std::string& outputDir) {
     if (!outputDir.empty()) {
         m_OutputDirectory = outputDir;
     }
@@ -47,7 +276,7 @@ bool UE4Extractor::Initialize(const std::string& pipeName, const std::string& ou
         return false;
     }
 
-    if (!InitializePipe()) {
+    if (!InitializeCommunication(baseName)) {
         return false;
     }
 
@@ -61,7 +290,6 @@ bool UE4Extractor::InitializeSDK() {
         }
 
         auto testWorld = SDK::UWorld::GetWorld();
-
         return true;
     }
     catch (...) {
@@ -105,63 +333,26 @@ bool UE4Extractor::ValidateUEEnvironment() {
     }
 }
 
-bool UE4Extractor::InitializePipe() {
-    DebugLog("=== InitializePipe() START ===");
+bool UE4Extractor::InitializeCommunication(const std::string& baseName) {
+    DebugLog("=== InitializeCommunication() START ===");
+    DebugLog("Base name: " + baseName);
 
     try {
-        std::string fullPipeName = "\\\\.\\pipe\\" + m_PipeName;
-        DebugLog("Creating pipe: " + fullPipeName);
-
-        m_hPipe = CreateNamedPipeA(
-            fullPipeName.c_str(),
-            PIPE_ACCESS_OUTBOUND,                    // Server writes, client reads
-            PIPE_TYPE_BYTE |                         // BYTE mode
-            PIPE_READMODE_BYTE |                     // BYTE read mode
-            PIPE_WAIT,                              // Blocking mode
-            1,                                      // Max instances
-            8192,                                   // Out buffer size
-            8192,                                   // In buffer size  
-            0,                                      // Use default timeout
-            NULL                                    // Default security
-        );
-
-        if (m_hPipe == INVALID_HANDLE_VALUE) {
-            DWORD error = GetLastError();
-            DebugLog("ERROR: CreateNamedPipe failed with error: " + std::to_string(error));
-
-            switch (error) {
-            case ERROR_INVALID_PARAMETER:
-                DebugLog("   -> ERROR_INVALID_PARAMETER: Invalid pipe name or parameters");
-                break;
-            case ERROR_ACCESS_DENIED:
-                DebugLog("   -> ERROR_ACCESS_DENIED: Insufficient permissions");
-                break;
-            case ERROR_PIPE_BUSY:
-                DebugLog("   -> ERROR_PIPE_BUSY: Pipe name already in use");
-                break;
-            case ERROR_INVALID_NAME:
-                DebugLog("   -> ERROR_INVALID_NAME: Invalid pipe name format");
-                break;
-            default:
-                DebugLog("   -> Unknown error code: " + std::to_string(error));
-                break;
-            }
+        if (!m_pCommunicator->Initialize(baseName)) {
+            DebugLog("ERROR: Failed to initialize shared memory communicator");
             return false;
         }
 
-        DebugLog("Pipe created successfully");
-        DebugLog("Pipe handle: " + std::to_string(reinterpret_cast<uintptr_t>(m_hPipe)));
-        DebugLog("Pipe access: OUTBOUND (server writes, client reads)");
-        DebugLog("Pipe mode: BYTE STREAM (compatible with StreamReader)");
-        DebugLog("=== InitializePipe() SUCCESS ===");
+        DebugLog("Shared memory communication initialized successfully");
+        DebugLog("=== InitializeCommunication() SUCCESS ===");
         return true;
     }
     catch (const std::exception& e) {
-        DebugLog("EXCEPTION in InitializePipe(): " + std::string(e.what()));
+        DebugLog("EXCEPTION in InitializeCommunication(): " + std::string(e.what()));
         return false;
     }
     catch (...) {
-        DebugLog("UNKNOWN EXCEPTION in InitializePipe()");
+        DebugLog("UNKNOWN EXCEPTION in InitializeCommunication()");
         return false;
     }
 }
@@ -177,7 +368,9 @@ void UE4Extractor::StartExtraction() {
     DebugLog("Setting up extraction...");
     m_bShouldStop.store(false);
 
-    DebugLog("Creating communication thread only...");
+    m_pCommunicator->SendStatus("DLL connected successfully");
+
+    DebugLog("Creating communication thread...");
     m_hCommunicationThread = CreateThread(NULL, 0, CommunicationThreadProc, this, 0, NULL);
     if (m_hCommunicationThread == NULL) {
         DWORD error = GetLastError();
@@ -227,10 +420,7 @@ void UE4Extractor::ExtractionMainLoop() {
     m_bIsRunning.store(true);
 
     try {
-        DebugLog("Waiting a moment for client to be fully ready...");
-        Sleep(1000);
-
-        DebugLog("Starting test extraction sequence...");
+        DebugLog("Starting comprehensive asset extraction...");
 
         SendProgress(0, "Starting comprehensive asset extraction...");
         Sleep(500);
@@ -239,17 +429,29 @@ void UE4Extractor::ExtractionMainLoop() {
         Sleep(500);
 
         SendProgress(25, "Scanning object hierarchy...");
-        Sleep(1000);
 
-        SendProgress(50, "Processing assets...");
-        Sleep(2000);
+        auto allAssets = ExtractAllAssets();
+
+        SendProgress(60, "Extracting level actors...");
+
+        auto levelActors = ExtractLevelActors();
+
+        m_ExtractedObjects.insert(m_ExtractedObjects.end(), allAssets.begin(), allAssets.end());
+        m_ExtractedObjects.insert(m_ExtractedObjects.end(), levelActors.begin(), levelActors.end());
 
         SendProgress(75, "Saving extracted data...");
-        Sleep(1000);
 
-        SendProgress(100, "Extraction completed successfully!");
+        bool saveSuccess = SaveExtractedData();
 
-        DebugLog("Test extraction sequence completed");
+        if (saveSuccess) {
+            SendProgress(100, "Extraction completed successfully!");
+            m_pCommunicator->SendComplete();
+        }
+        else {
+            m_pCommunicator->SendError("Failed to save some extracted data");
+        }
+
+        DebugLog("Extraction sequence completed with " + std::to_string(m_ExtractedObjects.size()) + " objects");
 
         for (int i = 0; i < 10 && !m_bShouldStop.load(); i++) {
             Sleep(1000);
@@ -259,11 +461,11 @@ void UE4Extractor::ExtractionMainLoop() {
     catch (const std::exception& e) {
         std::string errorMsg = "Extraction failed: " + std::string(e.what());
         DebugLog("EXCEPTION in ExtractionMainLoop: " + errorMsg);
-        SendProgress(0, errorMsg);
+        m_pCommunicator->SendError(errorMsg);
     }
     catch (...) {
         DebugLog("UNKNOWN EXCEPTION in ExtractionMainLoop");
-        SendProgress(0, "Extraction failed: Unknown error");
+        m_pCommunicator->SendError("Extraction failed: Unknown error");
     }
 
     m_bIsRunning.store(false);
@@ -272,73 +474,51 @@ void UE4Extractor::ExtractionMainLoop() {
 
 void UE4Extractor::CommunicationLoop() {
     DebugLog("=== CommunicationLoop() START ===");
-    DebugLog("Pipe handle: " + std::to_string(reinterpret_cast<uintptr_t>(m_hPipe)));
 
     try {
-        if (m_hPipe == INVALID_HANDLE_VALUE) {
-            DebugLog("ERROR: Invalid pipe handle in CommunicationLoop");
-            return;
+        DebugLog("Waiting a moment for client to be ready...");
+        Sleep(1000);
+
+        DebugLog("Sending initial progress message...");
+        SendProgress(1, "DLL communication established");
+
+        Sleep(500);
+
+        DebugLog("Starting extraction thread...");
+        if (m_hExtractionThread == NULL) {
+            m_hExtractionThread = CreateThread(NULL, 0, ExtractionThreadProc, this, 0, NULL);
+            if (m_hExtractionThread == NULL) {
+                DWORD threadError = GetLastError();
+                DebugLog("ERROR: Failed to create extraction thread. Error: " + std::to_string(threadError));
+            }
+            else {
+                DebugLog("Extraction thread created successfully");
+            }
         }
 
-        DebugLog("Waiting for client connection on pipe...");
-        BOOL connected = ConnectNamedPipe(m_hPipe, NULL);
-        DWORD error = GetLastError();
-
-        DebugLog("ConnectNamedPipe result: " + std::to_string(connected));
-        DebugLog("GetLastError: " + std::to_string(error));
-
-        if (connected || error == ERROR_PIPE_CONNECTED) {
-            DebugLog("CLIENT CONNECTED SUCCESSFULLY!");
-
-            DebugLog("Waiting for client to fully initialize...");
-            Sleep(1000);
-
-            DebugLog("Sending initial connection message...");
-            SendProgress(1, "DLL connected successfully");
-
-            Sleep(500);
-
-            DebugLog("Sent initial progress message");
-
-            DebugLog("Starting extraction thread now that client is connected...");
-            if (m_hExtractionThread == NULL) {
-                m_hExtractionThread = CreateThread(NULL, 0, ExtractionThreadProc, this, 0, NULL);
-                if (m_hExtractionThread == NULL) {
-                    DWORD threadError = GetLastError();
-                    DebugLog("ERROR: Failed to create extraction thread. Error: " + std::to_string(threadError));
-                }
-                else {
-                    DebugLog("Extraction thread created successfully");
-                }
+        DebugLog("Entering main communication loop...");
+        int loopCount = 0;
+        while (!m_bShouldStop.load()) {
+            if (loopCount % 50 == 0) {
+                DebugLog("Communication loop iteration: " + std::to_string(loopCount / 50));
             }
 
-            DebugLog("Entering main communication loop...");
-            int loopCount = 0;
-            while (!m_bShouldStop.load()) {
-                if (loopCount % 50 == 0) {
-                    DebugLog("Communication loop iteration: " + std::to_string(loopCount / 50));
-                }
+            ProcessCommands();
+            Sleep(100);
+            loopCount++;
 
-                ProcessCommands();
-                Sleep(100);
-                loopCount++;
-
-                if (m_hExtractionThread != NULL) {
-                    DWORD exitCode = 0;
-                    if (GetExitCodeThread(m_hExtractionThread, &exitCode)) {
-                        if (exitCode != STILL_ACTIVE) {
-                            DebugLog("Extraction thread completed with exit code: " + std::to_string(exitCode));
-                            break;
-                        }
+            if (m_hExtractionThread != NULL) {
+                DWORD exitCode = 0;
+                if (GetExitCodeThread(m_hExtractionThread, &exitCode)) {
+                    if (exitCode != STILL_ACTIVE) {
+                        DebugLog("Extraction thread completed with exit code: " + std::to_string(exitCode));
+                        break;
                     }
                 }
             }
+        }
 
-            DebugLog("Communication loop ended normally");
-        }
-        else {
-            DebugLog("ERROR: ConnectNamedPipe failed with error: " + std::to_string(error));
-        }
+        DebugLog("Communication loop ended normally");
     }
     catch (const std::exception& e) {
         DebugLog("EXCEPTION in CommunicationLoop: " + std::string(e.what()));
@@ -387,7 +567,6 @@ std::vector<CompleteObjectData> UE4Extractor::ExtractAllAssets() {
                 }
             }
             catch (...) {
-                // Skip problematic objects
             }
 
             if (i % 100 == 0) {
@@ -436,7 +615,6 @@ std::vector<CompleteObjectData> UE4Extractor::ExtractLevelActors() {
                 }
             }
             catch (...) {
-                // Skip problematic actors
             }
 
             if (i % 10 == 0) {
@@ -468,19 +646,17 @@ CompleteObjectData UE4Extractor::ExtractCompleteObject(SDK::UObject* object) {
         try {
             auto objectPtr = reinterpret_cast<uintptr_t*>(object);
             if (IsValidMemoryAddress(reinterpret_cast<uintptr_t>(objectPtr + 1))) {
-                objectData.ObjectFlags = static_cast<uint32_t>(objectPtr[1]); // Rough estimate
+                objectData.ObjectFlags = static_cast<uint32_t>(objectPtr[1]);
             }
             objectData.InternalIndex = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(object) & 0xFFFFFFFF);
         }
         catch (...) {
-            // Skip if not accessible
         }
 
         objectData.Properties = ExtractObjectProperties(object);
         objectData.Dependencies = ExtractObjectDependencies(object);
         objectData.PropertyData = SerializeObjectProperties(object);
 
-        // Extract type-specific data based on class name
         std::string className = objectData.ClassName;
         if (className.find("StaticMesh") != std::string::npos) {
             ExtractStaticMeshData(static_cast<SDK::UStaticMesh*>(object), objectData);
@@ -517,15 +693,15 @@ bool UE4Extractor::ExtractStaticMeshData(SDK::UStaticMesh* staticMesh, CompleteO
             return false;
         }
 
-        // access render data dependent on SDK generation
+        // Access render data dependent on SDK generation
         // For now, basic information and note that mesh data exists
         objectData.MeshInfo.VertexCount = 0;
         objectData.MeshInfo.FaceCount = 0;
 
-        // access materials if available
+        // Access materials if available
         try {
             // Look for StaticMaterials or Materials member
-            //SDK-dependent, so we'll try a generic approach
+            // SDK-dependent, so we'll try a generic approach
             objectData.MeshInfo.MaterialSlots.push_back("DefaultMaterial");
         }
         catch (...) {
@@ -547,7 +723,7 @@ bool UE4Extractor::ExtractSkeletalMeshData(SDK::USkeletalMesh* skeletalMesh, Com
 
         objectData.MeshInfo.VertexCount = 0;
 
-        // extract basic skeletal information
+        // Extract basic skeletal information
         try {
             // Look for skeleton reference - SDK dependent
             objectData.AnimInfo.BoneNames.push_back("RootBone"); // Placeholder
@@ -570,7 +746,7 @@ bool UE4Extractor::ExtractTextureData(SDK::UTexture2D* texture, CompleteObjectDa
         }
 
         // Try to access basic texture properties
-        // member names are SDK-dependent
+        // Member names are SDK-dependent
         try {
             // Look for SizeX, SizeY, or similar members
             objectData.TextureInfo.Width = 0;   // Will try to populate from SDK
@@ -578,7 +754,6 @@ bool UE4Extractor::ExtractTextureData(SDK::UTexture2D* texture, CompleteObjectDa
             objectData.TextureInfo.Format = 0;
             objectData.TextureInfo.MipLevels = 1;
             objectData.TextureInfo.CompressionFormat = "Unknown";
-
         }
         catch (...) {
             // Use defaults if members not accessible
@@ -694,8 +869,7 @@ std::unordered_map<std::string, std::string> UE4Extractor::ExtractObjectProperti
         properties["Class"] = GetObjectClassName(object);
 
         // Try to access additional properties if available in SDK
-        //highly dependent on the specific SDK generation
-
+        // This is highly dependent on the specific SDK generation
     }
     catch (...) {
     }
@@ -715,7 +889,6 @@ std::vector<std::string> UE4Extractor::ExtractObjectDependencies(SDK::UObject* o
         if (!className.empty()) {
             dependencies.push_back(className);
         }
-
     }
     catch (...) {
     }
@@ -854,90 +1027,22 @@ std::string UE4Extractor::SafeGetString(const char* str) {
 void UE4Extractor::SendProgress(int percentage, const std::string& message, uint32_t processed, uint32_t total) {
     m_ProgressPercent.store(percentage);
 
-    try {
-        if (m_hPipe != INVALID_HANDLE_VALUE) {
-            std::ostringstream oss;
-            oss << percentage << "|" << message;
-            if (total > 0) {
-                oss << " (" << processed << "/" << total << ")";
-            }
-            oss << "\n";
-
-            std::string fullMessage = oss.str();
-            DWORD written = 0;
-
-            DebugLog("Attempting to send progress: " + fullMessage.substr(0, fullMessage.length() - 1));
-
-            BOOL result = WriteFile(m_hPipe, fullMessage.c_str(), static_cast<DWORD>(fullMessage.length()), &written, NULL);
-            if (!result) {
-                DWORD error = GetLastError();
-                DebugLog("ERROR: WriteFile failed with error: " + std::to_string(error));
-
-                // Decode common pipe errors
-                switch (error) {
-                case ERROR_PIPE_NOT_CONNECTED:
-                    DebugLog("   -> ERROR_PIPE_NOT_CONNECTED (536): Client not connected yet");
-                    break;
-                case ERROR_NO_DATA:
-                    DebugLog("   -> ERROR_NO_DATA (232): Pipe is closing or closed");
-                    m_bShouldStop.store(true);
-                    break;
-                case ERROR_BROKEN_PIPE:
-                    DebugLog("   -> ERROR_BROKEN_PIPE: Client disconnected");
-                    m_bShouldStop.store(true);
-                    break;
-                default:
-                    DebugLog("   -> Unknown pipe error: " + std::to_string(error));
-                    break;
-                }
-            }
-            else {
-                DebugLog("Progress sent successfully. Bytes written: " + std::to_string(written));
-                FlushFileBuffers(m_hPipe);
-            }
-        }
-        else {
-            DebugLog("WARNING: Cannot send progress - invalid pipe handle");
-        }
-    }
-    catch (const std::exception& e) {
-        DebugLog("EXCEPTION in SendProgress: " + std::string(e.what()));
-    }
-    catch (...) {
-        DebugLog("UNKNOWN EXCEPTION in SendProgress");
+    if (m_pCommunicator) {
+        m_pCommunicator->SendProgress(percentage, message, processed, total);
     }
 }
 
 void UE4Extractor::SendObjectData(const CompleteObjectData& objectData) {
-    if (m_hPipe != INVALID_HANDLE_VALUE) {
+    if (m_pCommunicator) {
         std::ostringstream oss;
-        oss << "OBJECT|" << objectData.Name << "|" << objectData.ClassName << "|" << objectData.PackageName << "\n";
-
-        std::string message = oss.str();
-        DWORD written;
-        WriteFile(m_hPipe, message.c_str(), static_cast<DWORD>(message.length()), &written, NULL);
-        FlushFileBuffers(m_hPipe);
+        oss << objectData.Name << "|" << objectData.ClassName << "|" << objectData.PackageName;
+        m_pCommunicator->SendMessage(MessageType::ObjectData, oss.str());
     }
 }
 
 void UE4Extractor::ProcessCommands() {
-    try {
-        if (m_hPipe != INVALID_HANDLE_VALUE) {
-            DWORD written = 0;
-            BOOL result = WriteFile(m_hPipe, "", 0, &written, NULL);
-            if (!result) {
-                DWORD error = GetLastError();
-                if (error == ERROR_NO_DATA || error == ERROR_BROKEN_PIPE) {
-                    DebugLog("Pipe disconnected (error " + std::to_string(error) + "), stopping extraction");
-                    m_bShouldStop.store(true);
-                }
-            }
-        }
-    }
-    catch (...) {
-        DebugLog("Exception checking pipe status, stopping extraction");
-        m_bShouldStop.store(true);
-    }
+    // This method can be used for bidirectional communication if needed
+    // For now, it's just a placeholder that checks if we should stop
 }
 
 bool UE4Extractor::SaveExtractedData() {
@@ -983,6 +1088,7 @@ bool UE4Extractor::SaveObjectToFile(const CompleteObjectData& objectData) {
         std::string className = objectData.ClassName;
         std::string filename = objectData.Name;
 
+        // Sanitize filename
         std::replace(filename.begin(), filename.end(), '/', '_');
         std::replace(filename.begin(), filename.end(), '\\', '_');
         std::replace(filename.begin(), filename.end(), ':', '_');
@@ -1234,8 +1340,8 @@ extern "C" {
         delete extractor;
     }
 
-    __declspec(dllexport) bool InitializeExtractor(UE4Extractor* extractor, const char* pipeName, const char* outputDir) {
-        return extractor ? extractor->Initialize(pipeName, outputDir ? outputDir : "") : false;
+    __declspec(dllexport) bool InitializeExtractor(UE4Extractor* extractor, const char* baseName, const char* outputDir) {
+        return extractor ? extractor->Initialize(baseName, outputDir ? outputDir : "") : false;
     }
 
     __declspec(dllexport) void StartExtraction(UE4Extractor* extractor) {
